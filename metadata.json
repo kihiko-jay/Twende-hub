@@ -1,0 +1,5 @@
+{
+  "name": "TwendeHub",
+  "description": "A multi-tenant event creation platform for outdoor and group-based experiences like hiking, road trips, and photography excursions.",
+  "requestFramePermissions": ["geolocation"]
+}
