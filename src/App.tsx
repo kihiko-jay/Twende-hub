@@ -154,7 +154,7 @@ export default function App() {
                 <div className="col-span-2">
                   <span className="text-3xl font-serif font-bold text-white mb-6 block">TwendeHub</span>
                   <p className="max-w-md">
-                    Building the world's most trusted platform for outdoor adventures and group experiences. Join us in exploring the beauty of Kenya.
+                    Building the the world's most trusted platform for outdoor adventures and group experiences. Join us in exploring the beauty of Kenya.
                   </p>
                 </div>
                 <div>
