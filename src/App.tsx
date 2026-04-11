@@ -176,7 +176,7 @@ export default function App() {
                 </div>
               </div>
               <div className="mt-20 pt-8 border-t border-stone-800 text-sm flex justify-between items-center">
-                <p>&copy; 20267 TwendeHub. All rights reserved.</p>
+                <p>&copy; 2026 TwendeHub. All rights reserved.</p>
                 <div className="flex space-x-6">
                   <a href="https://instagram.com/twendehub" className="hover:text-white">Instagram</a>
                   <a href="https://twitter.com/twendehub" className="hover:text-white">Twitter</a>
