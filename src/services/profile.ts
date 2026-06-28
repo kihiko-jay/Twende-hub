@@ -116,11 +116,13 @@ export async function getMyBookings(userId: string): Promise<{
 }> {
   const { data: vbRows } = await supabase
     .from("vehicle_bookings")
-    .select("id, status, total_price, organizer_id, vehicles(make, model), events(title), users!vehicle_bookings_organizer_id_fkey(name)");
+    .select("id, status, total_price, organizer_id, vehicles(make, model), events(title), users!vehicle_bookings_organizer_id_fkey(name)")
+    .or(`organizer_id.eq.${userId},vehicles.owner_id.eq.${userId}`);
 
   const { data: pbRows } = await supabase
     .from("photographer_bookings")
-    .select("id, status, total_price, organizer_id, events(title), users!photographer_bookings_organizer_id_fkey(name)");
+    .select("id, status, total_price, organizer_id, events(title), users!photographer_bookings_organizer_id_fkey(name)")
+    .or(`organizer_id.eq.${userId},photographers.user_id.eq.${userId}`);
 
   const vehicleBookings: BookingSummary[] = [];
   const myServiceVehicleBookings: BookingSummary[] = [];

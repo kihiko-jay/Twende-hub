@@ -16,12 +16,9 @@ export default function Login() {
     e.preventDefault();
     setError('');
     setMagicMessage('');
-    // Debug: log start of login flow
-    // console.log('[Login] submit start', { email });
     setIsSubmitting(true);
     try {
       await login(email, password);
-      // console.log('[Login] login succeeded, navigating');
       navigate('/');
     } catch (err: unknown) {
       const msg =

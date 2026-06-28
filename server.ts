@@ -1,5 +1,5 @@
 import "dotenv/config";
-import express from "express";
+import express, { type Request, type Response } from "express";
 import { createServer as createViteServer } from "vite";
 import cors from "cors";
 import jwt from "jsonwebtoken";
@@ -11,22 +11,20 @@ import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
 import config from "./src/config.js";
 import { supabaseServer } from "./src/lib/supabaseServer.js";
+import { log } from "./src/lib/logger.js";
 import {
   sendEmail,
   paymentReceiptEmail,
-  vehicleBookingRequestEmail,
-  photographerBookingRequestEmail,
   bookingConfirmationEmail,
-  activityRequestJoinEmail,
-  activityRequestConvertedEmail,
 } from "./src/lib/email.js";
 import { applyApprovedPaymentEffects, extractMpesaReceipt, normalizePaymentStatus } from "./src/server/paymentService.js";
 import { registerAdminRoutes } from "./src/server/adminRoutes.js";
 import { getManualReviewType, isValidKenyanPhone, normalizeKenyanPhone } from "./src/server/paymentUtils.js";
 import { registerPayoutRoutes } from "./src/server/payoutRoutes.js";
+import { registerNotificationRoutes } from "./src/server/notificationRoutes.js";
 import type { AuthedRequest } from "./src/server/types.js";
 
-const supabase = supabaseServer as any;
+const supabase = supabaseServer;
 
 
 async function finalizeParticipantBookingPayment(payment: { id: number; event_id: number; user_id: string }) {
@@ -56,7 +54,7 @@ async function getMpesaAccessToken() {
   if (!res.ok) {
     throw new Error(`Failed to get M-Pesa access token: ${res.status}`);
   }
-  const data = (await res.json()) as any;
+  const data = await res.json() as Record<string, unknown>;
   return data.access_token as string;
 }
 
@@ -76,7 +74,7 @@ async function logPayoutTraffic(payload: {
   direction: string;
   endpoint: string;
   status_code: number;
-  payload: any;
+  payload: unknown;
   error?: string | null;
 }) {
   await supabase.from('payout_logs').insert({
@@ -84,7 +82,7 @@ async function logPayoutTraffic(payload: {
     direction: payload.direction,
     endpoint: payload.endpoint,
     status_code: payload.status_code,
-    payload: payload.payload,
+    payload: payload.payload as Record<string, unknown>,
     error: payload.error ?? null,
   });
 }
@@ -92,6 +90,10 @@ async function logPayoutTraffic(payload: {
 async function startServer() {
   const app = express();
   const server = http.createServer(app);
+
+  // Trust one reverse-proxy hop so req.ip reflects the real client IP
+  // and X-Forwarded-For is only read from a verified upstream.
+  app.set('trust proxy', 1);
 
   const corsOrigins = config.corsOrigins
     .split(",")
@@ -112,26 +114,22 @@ async function startServer() {
   app.use(compression());
   app.use(express.json({ limit: "1mb" }));
 
-  // --- Security headers (CSP, basic hardening) ---
-  app.use((req, res, next) => {
+  // --- Security headers ---
+  app.use((req: Request, res: Response, next) => {
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     res.setHeader("X-XSS-Protection", "0");
 
-    // In development, don't enforce CSP so Vite's client scripts work.
-    if (!config.isProd) {
-      return next();
-    }
+    if (!config.isProd) return next();
 
-    const nonce = crypto.randomBytes(16).toString("base64");
-    (res as any).locals = (res as any).locals || {};
-    (res as any).locals.cspNonce = nonce;
+    // In production the Vite build produces external .js files only (no inline
+    // scripts), so 'self' is sufficient — no nonce or unsafe-inline needed.
     const csp = [
       "default-src 'self'",
-      `script-src 'self' 'nonce-${nonce}'`,
+      "script-src 'self'",
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-      "img-src 'self' data: https://images.unsplash.com https://picsum.photos",
+      "img-src 'self' data: https://images.unsplash.com https://picsum.photos https://ofymavvwnqldipzetivb.supabase.co",
       "connect-src 'self' https://ofymavvwnqldipzetivb.supabase.co",
       "font-src 'self' https://fonts.gstatic.com",
       "frame-ancestors 'none'",
@@ -147,14 +145,23 @@ async function startServer() {
   const RATE_WINDOW_MS = 60_000;
   const RATE_LIMIT = 120;
 
+  // Evict expired entries from the in-memory fallback store every window.
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of rateLimitStore) {
+      if (entry.resetAt < now) rateLimitStore.delete(key);
+    }
+  }, RATE_WINDOW_MS);
+
   let ratelimit: Ratelimit | null = null;
   if (config.redisEnabled) {
     const redis = new Redis({ url: config.upstashRedisUrl, token: config.upstashRedisToken });
     ratelimit = new Ratelimit({ redis, limiter: Ratelimit.slidingWindow(120, '60 s') });
   }
 
-  app.use('/api', async (req: any, res, next) => {
-    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+  app.use('/api', async (req: Request, res: Response, next) => {
+    // req.ip is trusted because we set 'trust proxy' 1 above.
+    const ip = req.ip || 'unknown';
     if (ratelimit) {
       const result = await ratelimit.limit(`api:${ip}`);
       if (!result.success) {
@@ -176,13 +183,13 @@ async function startServer() {
     next();
   });
 
-  // --- Supabase JWT auth middleware (for payment + optional future routes) ---
-  const authenticateSupabase = async (req: any, res: any, next: any) => {
+  // --- Supabase JWT auth middleware ---
+  const authenticateSupabase = async (req: Request, res: Response, next: () => void) => {
     const authHeader = req.headers["authorization"];
     const token = authHeader && authHeader.split(" ")[1];
     if (!token) return res.sendStatus(401);
     if (!config.supabaseJwtSecret) {
-      console.error("SUPABASE_JWT_SECRET is required for authenticated routes");
+      log({ level: 'error', message: 'SUPABASE_JWT_SECRET is required for authenticated routes' });
       return res.sendStatus(503);
     }
     try {
@@ -195,7 +202,7 @@ async function startServer() {
         .eq("id", userId)
         .single();
       if (error || !profile) return res.sendStatus(403);
-      req.user = profile;
+      (req as AuthedRequest).user = profile as AuthedRequest['user'];
       next();
     } catch {
       return res.sendStatus(403);
@@ -203,29 +210,56 @@ async function startServer() {
   };
 
   // Request logging
-  app.use((req, res, next) => {
+  app.use((req: Request, res: Response, next) => {
     const start = Date.now();
     res.on("finish", () => {
-      console.log(`${req.method} ${req.originalUrl} ${res.statusCode} - ${Date.now() - start}ms`);
+      log({ level: 'info', message: `${req.method} ${req.originalUrl} ${res.statusCode}`, context: { ms: Date.now() - start } });
     });
     next();
   });
 
-  // Health check (Supabase)
-  app.get("/health", async (req, res) => {
+  // Health check
+  app.get("/health", async (_req: Request, res: Response) => {
     try {
       if (config.supabaseUrl && config.supabaseServiceRoleKey) {
         await supabase.from("events").select("id").limit(1).maybeSingle();
       }
       res.json({ status: "ok", env: config.nodeEnv });
-    } catch (e) {
+    } catch {
       res.status(500).json({ status: "error", env: config.nodeEnv });
     }
   });
 
-  // --- Payment routes (Supabase-backed) ---
-  app.post("/api/payments/initiate", authenticateSupabase, async (req: any, res) => {
-    const { event_id, type = "creation", phone, phone_number } = req.body;
+  // --- Payment routes ---
+  app.post("/api/payments/initiate", authenticateSupabase, async (req: Request, res: Response) => {
+    const authedReq = req as AuthedRequest;
+    const { event_id, type = "creation" as const, phone, phone_number } = req.body as {
+      event_id: number;
+      type?: import("./src/lib/supabase.types.js").PaymentType;
+      phone?: string;
+      phone_number?: string;
+    };
+
+    // For participant payments, validate the amount against the event's stored fee.
+    if (type === "participant") {
+      const { data: eventWithFee } = await supabase
+        .from("events")
+        .select("id, status, participant_fee")
+        .eq("id", event_id)
+        .eq("status", "active")
+        .single();
+      if (!eventWithFee) return res.status(404).json({ error: "Event not found or not active" });
+
+      const requestedAmount = Number(req.body.amount ?? 0);
+      const expectedFee = (eventWithFee as { id: number; status: string; participant_fee: number | null }).participant_fee ?? 0;
+
+      if (requestedAmount <= 0 || Number.isNaN(requestedAmount)) {
+        return res.status(400).json({ error: "Invalid participant fee amount" });
+      }
+      if (requestedAmount !== expectedFee) {
+        return res.status(400).json({ error: "Payment amount does not match event fee" });
+      }
+    }
 
     const amount =
       type === "feature"
@@ -236,10 +270,7 @@ async function startServer() {
         ? Number(req.body.amount ?? 0)
         : 1000;
 
-    if (type === "participant" && (amount <= 0 || Number.isNaN(amount))) {
-      return res.status(400).json({ error: "Invalid participant fee amount" });
-    }
-
+    // Fetch event for authorization (non-participant types must be owned by the requester).
     const { data: event, error: eventErr } =
       type === "participant"
         ? await supabase
@@ -252,22 +283,23 @@ async function startServer() {
             .from("events")
             .select("id")
             .eq("id", event_id)
-            .eq("organizer_id", req.user.id)
+            .eq("organizer_id", authedReq.user.id)
             .single();
     if (eventErr || !event) return res.status(404).json({ error: "Event not found or unauthorized" });
-    const msisdn = phone_number || phone || req.user.phone;
+
+    const msisdn = phone_number || phone || authedReq.user.phone;
     if (!msisdn) return res.status(400).json({ error: "Phone number is required for M-Pesa payment" });
     if (!isValidKenyanPhone(msisdn)) {
       return res.status(400).json({ error: "Provide a valid Kenyan Safaricom phone number" });
     }
 
-    // Development / sandbox: simulate an asynchronous approval to exercise the full flow.
+    // Development / sandbox: simulate an asynchronous approval.
     if (!config.isProd || !config.mpesaEnabled) {
       const checkoutId = `MOCK-${event_id}-${Date.now()}`;
       const { data: payment, error: payErr } = await supabase
         .from("payments")
         .insert({
-          user_id: req.user.id,
+          user_id: authedReq.user.id,
           event_id: Number(event_id),
           amount,
           transaction_reference: checkoutId,
@@ -280,17 +312,15 @@ async function startServer() {
         return res.status(500).json({ error: "Failed to create payment record" });
       }
 
-      // After a short delay, auto-approve the payment and drive the same post-payment logic
-      // that the real M-Pesa callback uses. This runs in the background and does not block the response.
       setTimeout(async () => {
         try {
           await supabase
             .from("payments")
             .update({ payment_status: "confirmed", processed_at: new Date().toISOString() })
             .eq("id", payment.id);
-          await applyApprovedPaymentEffects(supabase, payment, finalizeParticipantBookingPayment);
-        } catch (e: any) {
-          console.error("Error auto-confirming mock payment", e?.message || e);
+          await applyApprovedPaymentEffects(supabase as Parameters<typeof applyApprovedPaymentEffects>[0], payment, finalizeParticipantBookingPayment);
+        } catch (err) {
+          log({ level: 'error', message: 'Error auto-confirming mock payment', error: err });
         }
       }, 3000);
 
@@ -309,7 +339,7 @@ async function startServer() {
     const { data: payment, error: payErr } = await supabase
       .from("payments")
       .insert({
-        user_id: req.user.id,
+        user_id: authedReq.user.id,
         event_id: Number(event_id),
         amount,
         transaction_reference: reference,
@@ -348,20 +378,20 @@ async function startServer() {
         headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
         body: JSON.stringify(stkBody),
       });
-      const stkData = (await stkRes.json()) as any;
+      const stkData = await stkRes.json() as Record<string, unknown>;
 
       await supabase.from("payment_logs").insert({
         direction: "outgoing",
         endpoint: "/mpesa/stkpush/v1/processrequest",
         status_code: stkRes.status,
-        payload: stkBody as any,
+        payload: stkBody as unknown as Record<string, unknown>,
         headers: null,
         error: !stkRes.ok ? JSON.stringify(stkData) : null,
         payment_id: payment.id,
       });
 
       if (!stkRes.ok || stkData.ResponseCode !== "0") {
-        console.error("M-Pesa STK error", stkData);
+        log({ level: 'error', message: 'M-Pesa STK error', context: stkData as Record<string, unknown> });
         return res.status(502).json({ error: "Failed to initiate M-Pesa payment" });
       }
 
@@ -381,23 +411,22 @@ async function startServer() {
         amount,
         phone: msisdn,
       });
-    } catch (e: any) {
-      console.error("Error initiating M-Pesa payment", e?.message || e);
+    } catch (err) {
+      log({ level: 'error', message: 'Error initiating M-Pesa payment', error: err });
       res.status(502).json({ error: "Failed to initiate M-Pesa payment" });
     }
   });
 
-  app.post("/api/payments/mpesa-callback", async (req: any, res) => {
+  app.post("/api/payments/mpesa-callback", async (req: Request, res: Response) => {
     try {
-      const rawBody = req.body;
-      const callback = rawBody?.Body?.stkCallback;
+      const rawBody = req.body as Record<string, unknown>;
+      const callback = (rawBody?.Body as Record<string, unknown>)?.stkCallback as Record<string, unknown> | undefined;
       if (!callback) return res.status(400).json({ error: "Invalid callback payload" });
 
       if (config.isProd && !config.mpesaWebhookSecret) {
         return res.status(503).json({ error: 'Webhook verification not configured' });
       }
 
-      // Optional in development, mandatory in production.
       if (config.mpesaWebhookSecret) {
         const signature = (req.headers["x-mpesa-signature"] as string) || "";
         const expected = crypto
@@ -405,7 +434,7 @@ async function startServer() {
           .update(JSON.stringify(rawBody))
           .digest("hex");
         if (!signature || signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
-          console.error("M-Pesa callback signature verification failed");
+          log({ level: 'error', message: 'M-Pesa callback signature verification failed' });
           return res.status(400).json({ error: "Invalid signature" });
         }
       }
@@ -414,113 +443,89 @@ async function startServer() {
       const resultCode = callback.ResultCode as number;
       const resultDesc = callback.ResultDesc as string;
 
-      const { data: paymentRow } = await supabase
+      // Atomically claim the payment by updating only if still pending.
+      // This prevents duplicate callbacks from both applying payment effects.
+      const { data: updatedRows } = await supabase
         .from("payments")
-        .select("id, event_id, user_id, amount, payment_type, payment_status, provider_payment_id")
+        .update({
+          payment_status: resultCode === 0 ? "confirmed" : "failed",
+          processed_at: new Date().toISOString(),
+          raw_payload: rawBody,
+          ...(resultCode !== 0 && {
+            error_code: String(resultCode),
+            error_message: resultDesc,
+          }),
+        })
         .eq("transaction_reference", checkoutId)
-        .single();
-
-      const pay = paymentRow as {
-        id: number;
-        event_id: number;
-        user_id: string;
-        amount: number;
-        payment_type: string;
-        payment_status: string;
-        provider_payment_id: string | null;
-      } | null;
+        .eq("payment_status", "pending")
+        .select("id, event_id, user_id, amount, payment_type, provider_payment_id");
 
       await supabase.from("payment_logs").insert({
         direction: "incoming",
         endpoint: "/api/payments/mpesa-callback",
         status_code: 200,
         payload: rawBody,
-        headers: req.headers as any,
+        headers: req.headers as unknown as Record<string, unknown>,
         error: null,
-        payment_id: pay?.id ?? null,
+        payment_id: (updatedRows?.[0] as { id: number } | undefined)?.id ?? null,
       });
 
-      if (!pay) {
-        console.error("Payment not found for CheckoutRequestID", checkoutId);
-        return res.json({ ResultCode: 0, ResultDesc: "Received" });
-      }
-
-      // Idempotency: if the payment is already in a terminal state, just ACK.
-      if (pay.payment_status === "confirmed" || pay.payment_status === "refunded" || pay.payment_status === "failed") {
+      if (!updatedRows || updatedRows.length === 0) {
+        // Either not found or already in a terminal state — safe to ACK.
         return res.json({ ResultCode: 0, ResultDesc: "Already processed" });
       }
 
+      const pay = updatedRows[0] as {
+        id: number;
+        event_id: number;
+        user_id: string;
+        amount: number;
+        payment_type: string;
+        provider_payment_id: string | null;
+      };
+
       if (resultCode === 0) {
         const mpesaReceipt = extractMpesaReceipt(rawBody);
-        await supabase
-          .from("payments")
-          .update({
-            payment_status: "confirmed",
-            processed_at: new Date().toISOString(),
-            raw_payload: rawBody,
-            provider_payment_id: mpesaReceipt ?? pay.provider_payment_id,
-          })
-          .eq("id", pay.id);
 
-        await applyApprovedPaymentEffects(supabase, pay, finalizeParticipantBookingPayment);
+        if (mpesaReceipt) {
+          await supabase
+            .from("payments")
+            .update({ provider_payment_id: mpesaReceipt })
+            .eq("id", pay.id);
+        }
+
+        await applyApprovedPaymentEffects(supabase as Parameters<typeof applyApprovedPaymentEffects>[0], pay, finalizeParticipantBookingPayment);
 
         if (pay.payment_type === "participant") {
-
           (async () => {
             try {
-              const { data: userRow } = await supabase
-                .from("users")
-                .select("email")
-                .eq("id", pay.user_id)
-                .single();
-              const { data: eventRow } = await supabase
-                .from("events")
-                .select("title, date_time, location")
-                .eq("id", pay.event_id)
-                .single();
-
+              const { data: userRow } = await supabase.from("users").select("email").eq("id", pay.user_id).single();
+              const { data: eventRow } = await supabase.from("events").select("title, date_time, location").eq("id", pay.event_id).single();
               const email = (userRow as { email: string } | null)?.email;
-              const eventTitle = (eventRow as { title: string; date_time: string; location: string } | null)
-                ?.title;
-              const eventDate = (eventRow as { title: string; date_time: string; location: string } | null)
-                ?.date_time;
-              const eventLocation = (eventRow as { title: string; date_time: string; location: string } | null)
-                ?.location;
-
-              if (email && eventTitle && eventDate && eventLocation) {
+              const ev = eventRow as { title: string; date_time: string; location: string } | null;
+              if (email && ev) {
                 const payload = bookingConfirmationEmail(email, {
-                  eventTitle,
-                  eventDate: new Date(eventDate).toLocaleString("en-KE", {
-                    dateStyle: "full",
-                    timeStyle: "short",
-                  }),
-                  eventLocation,
+                  eventTitle: ev.title,
+                  eventDate: new Date(ev.date_time).toLocaleString("en-KE", { dateStyle: "full", timeStyle: "short" }),
+                  eventLocation: ev.location,
                   bookingType: "Event Participation",
                 });
                 await sendEmail(payload.to, payload.subject, payload.html);
               }
-            } catch (e: any) {
-              console.error("Failed to send booking confirmation email", e?.message || e);
+            } catch (err) {
+              log({ level: 'error', message: 'Failed to send booking confirmation email', error: err });
             }
           })();
         }
 
-        // Fire-and-forget payment receipt email
         (async () => {
           try {
-            const { data: userRow } = await supabase
-              .from("users")
-              .select("email")
-              .eq("id", pay.user_id)
-              .single();
-            const { data: eventRow } = await supabase
-              .from("events")
-              .select("title")
-              .eq("id", pay.event_id)
-              .single();
+            const { data: userRow } = await supabase.from("users").select("email").eq("id", pay.user_id).single();
+            const { data: eventRow } = await supabase.from("events").select("title").eq("id", pay.event_id).single();
             const email = (userRow as { email: string } | null)?.email;
             const title = (eventRow as { title: string } | null)?.title;
             if (email && title) {
+              const mpesaReceipt = extractMpesaReceipt(rawBody);
               const payload = paymentReceiptEmail(email, {
                 eventTitle: title,
                 amount: pay.amount,
@@ -529,22 +534,11 @@ async function startServer() {
               });
               await sendEmail(payload.to, payload.subject, payload.html);
             }
-          } catch (e: any) {
-            console.error("Failed to send payment receipt email", e?.message || e);
+          } catch (err) {
+            log({ level: 'error', message: 'Failed to send payment receipt email', error: err });
           }
         })();
       } else {
-        await supabase
-          .from("payments")
-          .update({
-            payment_status: "failed",
-            processed_at: new Date().toISOString(),
-            error_code: String(resultCode),
-            error_message: resultDesc,
-            raw_payload: rawBody,
-          })
-          .eq("id", pay.id);
-
         if (pay.payment_type === "creation") {
           await supabase.rpc("fail_event_creation_payment", {
             p_event_id: pay.event_id,
@@ -554,17 +548,16 @@ async function startServer() {
         }
       }
 
-      // M-Pesa requires a fast 200 OK style ACK.
       res.json({ ResultCode: 0, ResultDesc: "Success" });
-    } catch (e: any) {
-      console.error("Error handling M-Pesa callback", e?.message || e);
+    } catch (err) {
+      log({ level: 'error', message: 'Error handling M-Pesa callback', error: err });
       res.json({ ResultCode: 0, ResultDesc: "Received" });
     }
   });
 
-  // Polling endpoint used by the new payment UI.
-  app.get("/api/payments/status/:checkout_request_id", authenticateSupabase, async (req: any, res) => {
-    const checkoutId = req.params.checkout_request_id as string | undefined;
+  app.get("/api/payments/status/:checkout_request_id", authenticateSupabase, async (req: Request, res: Response) => {
+    const authedReq = req as AuthedRequest;
+    const checkoutId = req.params.checkout_request_id;
     if (!checkoutId) return res.status(400).json({ error: "checkout_request_id is required" });
 
     const { data: payment, error } = await supabase
@@ -584,11 +577,10 @@ async function startServer() {
       provider_payment_id: string | null;
     };
 
-    if (row.user_id !== req.user.id && req.user.role !== "admin") {
+    if (row.user_id !== authedReq.user.id && authedReq.user.role !== "admin") {
       return res.status(403).json({ error: "Not allowed" });
     }
 
-    // Map internal statuses to a simpler pending/success/failed contract for the UI.
     const status = normalizePaymentStatus(row.payment_status);
 
     res.json({
@@ -600,14 +592,15 @@ async function startServer() {
     });
   });
 
-  app.get("/api/payments/status", authenticateSupabase, async (req: any, res) => {
+  app.get("/api/payments/status", authenticateSupabase, async (req: Request, res: Response) => {
+    const authedReq = req as AuthedRequest;
     const eventId = parseInt(req.query.event_id as string, 10);
     if (!eventId) return res.status(400).json({ error: "event_id is required" });
     const { data: event } = await supabase
       .from("events")
       .select("status")
       .eq("id", eventId)
-      .eq("organizer_id", req.user.id)
+      .eq("organizer_id", authedReq.user.id)
       .single();
     if (!event) return res.status(404).json({ error: "Event not found or unauthorized" });
     const { data: payment } = await supabase
@@ -627,7 +620,8 @@ async function startServer() {
     });
   });
 
-  app.post("/api/payments/verify", authenticateSupabase, async (req: any, res) => {
+  app.post("/api/payments/verify", authenticateSupabase, async (req: Request, res: Response) => {
+    const authedReq = req as AuthedRequest;
     const { event_id, transaction_code, amount, phone_number, type } = req.body ?? {};
     const paymentType = getManualReviewType(type);
 
@@ -644,7 +638,7 @@ async function startServer() {
     const eventQuery = supabase.from("events").select("id, organizer_id, status").eq("id", event_id);
     const { data: event } = paymentType === "participant"
       ? await eventQuery.eq("status", "active").single()
-      : await eventQuery.eq("organizer_id", req.user.id).single();
+      : await eventQuery.eq("organizer_id", authedReq.user.id).single();
 
     if (!event) return res.status(404).json({ error: "Event not found or unauthorized" });
     if (paymentType === "participant" && Number(amount) <= 0) {
@@ -654,13 +648,13 @@ async function startServer() {
     const { data: payment, error: paymentError } = await supabase
       .from("payments")
       .insert({
-        user_id: req.user.id,
+        user_id: authedReq.user.id,
         event_id: Number(event_id),
         amount: Number(amount),
-        transaction_reference: transaction_code,
+        transaction_reference: transaction_code as string,
         payment_status: "manual_review_required",
         payment_type: paymentType,
-        provider_payment_id: transaction_code,
+        provider_payment_id: transaction_code as string,
         payment_provider: "mpesa-manual-review",
         raw_payload: {
           review_source: "manual_verify_endpoint",
@@ -678,7 +672,7 @@ async function startServer() {
       direction: "incoming",
       endpoint: "/api/payments/verify",
       status_code: 202,
-      payload: { event_id, transaction_code, amount, phone_number, payment_type: paymentType, review_status: "manual_review_required" },
+      payload: { event_id, transaction_code, amount, phone_number, payment_type: paymentType, review_status: "manual_review_required" } as Record<string, unknown>,
       headers: null,
       error: null,
       payment_id: payment.id,
@@ -691,9 +685,9 @@ async function startServer() {
     });
   });
 
-
   // --- Cancellation and refund eligibility helpers ---
-  app.get("/api/events/:id/can-cancel", authenticateSupabase, async (req: any, res) => {
+  app.get("/api/events/:id/can-cancel", authenticateSupabase, async (req: Request, res: Response) => {
+    const authedReq = req as AuthedRequest;
     const eventId = parseInt(req.params.id, 10);
     if (!eventId) return res.status(400).json({ error: "Invalid event id" });
 
@@ -704,213 +698,34 @@ async function startServer() {
       .single();
     if (eventErr || !event) return res.status(404).json({ error: "Event not found" });
 
-    const isOwner = (event as { organizer_id: string }).organizer_id === req.user.id;
-    const isAdmin = req.user.role === "admin";
+    const isOwner = (event as { organizer_id: string }).organizer_id === authedReq.user.id;
+    const isAdmin = authedReq.user.role === "admin";
     if (!isOwner && !isAdmin) return res.status(403).json({ error: "Not allowed" });
 
-    const { data, error } = await supabase.rpc("is_event_cancellable", {
-      p_event_id: eventId,
-    });
+    const { data, error } = await supabase.rpc("is_event_cancellable", { p_event_id: eventId });
     if (error) return res.status(500).json({ error: "Failed to evaluate" });
     res.json({ can_cancel: Boolean(data) });
   });
 
-  app.get("/api/payments/:id/can-refund", authenticateSupabase, async (req: any, res) => {
+  app.get("/api/payments/:id/can-refund", authenticateSupabase, async (req: Request, res: Response) => {
+    const authedReq = req as AuthedRequest;
     const paymentId = parseInt(req.params.id, 10);
     if (!paymentId) return res.status(400).json({ error: "Invalid payment id" });
 
-    if (req.user.role !== "admin") {
+    if (authedReq.user.role !== "admin") {
       return res.status(403).json({ error: "Only admins can check refund eligibility" });
     }
 
-    const { data, error } = await supabase.rpc("is_payment_refundable", {
-      p_payment_id: paymentId,
-    });
+    const { data, error } = await supabase.rpc("is_payment_refundable", { p_payment_id: paymentId });
     if (error) return res.status(500).json({ error: "Failed to evaluate" });
     res.json({ can_refund: Boolean(data) });
   });
 
-  // --- Booking notification email helpers ---
-  app.post("/api/vehicle-bookings/:id/notify", authenticateSupabase, async (req: any, res) => {
-    const bookingId = parseInt(req.params.id, 10);
-    if (!bookingId) return res.status(400).json({ error: "Invalid booking id" });
-    try {
-      const { data, error } = await supabase
-        .from("vehicle_bookings")
-        .select(
-          `
-            id,
-            notes,
-            events ( title ),
-            vehicles ( make, model, owner:users!vehicles_owner_id_fkey ( email ) ),
-            organizer:users!vehicle_bookings_organizer_id_fkey ( name )
-          `,
-        )
-        .eq("id", bookingId)
-        .single();
-      if (error || !data) return res.status(404).json({ error: "Booking not found" });
-      const row = data as any;
-      const ownerEmail = Array.isArray(row.vehicles?.owner)
-        ? row.vehicles.owner[0]?.email
-        : row.vehicles?.owner?.email;
-      if (!ownerEmail) return res.json({ status: "ok" });
-      const vehicleDesc = `${row.vehicles?.make ?? ""} ${row.vehicles?.model ?? ""}`.trim();
-      const payload = vehicleBookingRequestEmail(ownerEmail, {
-        vehicleDesc,
-        eventTitle: row.events?.title ?? "Your event",
-        organizerName: row.organizer?.name ?? "An organiser",
-        notes: row.notes ?? null,
-      });
-      await sendEmail(payload.to, payload.subject, payload.html);
-      res.json({ status: "ok" });
-    } catch (e: any) {
-      console.error("Failed to send vehicle booking email", e?.message || e);
-      res.status(500).json({ error: "Failed to send email" });
-    }
-  });
-
-  app.post("/api/photographer-bookings/:id/notify", authenticateSupabase, async (req: any, res) => {
-    const bookingId = parseInt(req.params.id, 10);
-    if (!bookingId) return res.status(400).json({ error: "Invalid booking id" });
-    try {
-      const { data, error } = await supabase
-        .from("photographer_bookings")
-        .select(
-          `
-            id,
-            notes,
-            events ( title ),
-            photographers ( users!photographers_user_id_fkey ( email ) ),
-            organizer:users!photographer_bookings_organizer_id_fkey ( name )
-          `,
-        )
-        .eq("id", bookingId)
-        .single();
-      if (error || !data) return res.status(404).json({ error: "Booking not found" });
-      const row = data as any;
-      const photographerEmail = Array.isArray(row.photographers?.users)
-        ? row.photographers.users[0]?.email
-        : row.photographers?.users?.email;
-      if (!photographerEmail) return res.json({ status: "ok" });
-      const payload = photographerBookingRequestEmail(photographerEmail, {
-        eventTitle: row.events?.title ?? "Your event",
-        organizerName: row.organizer?.name ?? "An organiser",
-        notes: row.notes ?? null,
-      });
-      await sendEmail(payload.to, payload.subject, payload.html);
-      res.json({ status: "ok" });
-    } catch (e: any) {
-      console.error("Failed to send photographer booking email", e?.message || e);
-      res.status(500).json({ error: "Failed to send email" });
-    }
-  });
-
-  // --- Activity request notification helpers ---
-  app.post("/api/activity-requests/:id/notify-creator", authenticateSupabase, async (req: any, res) => {
-    const requestId = req.params.id as string | undefined;
-    if (!requestId) return res.status(400).json({ error: "Invalid request id" });
-
-    try {
-      const { data, error } = await supabase
-        .from("activity_requests")
-        .select(
-          `
-            id,
-            creator:users!activity_requests_creator_id_fkey ( email ),
-            activity_type,
-            activity_date,
-            location_name,
-            min_people,
-            max_people
-          `,
-        )
-        .eq("id", requestId)
-        .single();
-      if (error || !data) return res.status(404).json({ error: "Activity request not found" });
-
-      const { data: members } = await supabase
-        .from("activity_request_members")
-        .select("id")
-        .eq("request_id", requestId);
-
-      const row = data as any;
-      const email = Array.isArray(row.creator) ? row.creator[0]?.email : row.creator?.email;
-      if (!email) return res.json({ status: "ok" });
-
-      const peopleJoined = (members ?? []).length;
-      const maxPeople = row.max_people ?? peopleJoined;
-      const activityDate = new Date(row.activity_date as string).toLocaleDateString("en-KE", {
-        dateStyle: "full",
-      });
-      const origin = config.appUrl || "https://twende.app";
-      const requestUrl = `${origin}/activity/${row.id}`;
-
-      const payload = activityRequestJoinEmail(email, {
-        activityType: row.activity_type ?? "Your plan",
-        activityDate,
-        locationName: row.location_name ?? "Your location",
-        peopleJoined,
-        maxPeople,
-        requestUrl,
-      });
-      await sendEmail(payload.to, payload.subject, payload.html);
-      res.json({ status: "ok" });
-    } catch (e: any) {
-      console.error("Failed to send activity request join email", e?.message || e);
-      res.status(500).json({ error: "Failed to send email" });
-    }
-  });
-
-  app.post("/api/activity-requests/:id/notify-converted", authenticateSupabase, async (req: any, res) => {
-    const requestId = req.params.id as string | undefined;
-    if (!requestId) return res.status(400).json({ error: "Invalid request id" });
-
-    try {
-      const { data, error } = await supabase
-        .from("activity_requests")
-        .select(
-          `
-            id,
-            creator:users!activity_requests_creator_id_fkey ( email ),
-            activity_type,
-            activity_date,
-            location_name,
-            event_id
-          `,
-        )
-        .eq("id", requestId)
-        .single();
-      if (error || !data) return res.status(404).json({ error: "Activity request not found" });
-      const row = data as any;
-
-      if (!row.event_id) return res.status(400).json({ error: "Request has not been converted to an event" });
-
-      const email = Array.isArray(row.creator) ? row.creator[0]?.email : row.creator?.email;
-      if (!email) return res.json({ status: "ok" });
-
-      const activityDate = new Date(row.activity_date as string).toLocaleDateString("en-KE", {
-        dateStyle: "full",
-      });
-      const origin = config.appUrl || "https://twende.app";
-      const eventUrl = `${origin}/events/${row.event_id}`;
-
-      const payload = activityRequestConvertedEmail(email, {
-        activityType: row.activity_type ?? "Your plan",
-        activityDate,
-        locationName: row.location_name ?? "Your location",
-        eventUrl,
-      });
-      await sendEmail(payload.to, payload.subject, payload.html);
-      res.json({ status: "ok" });
-    } catch (e: any) {
-      console.error("Failed to send activity request converted email", e?.message || e);
-      res.status(500).json({ error: "Failed to send email" });
-    }
-  });
+  registerNotificationRoutes({ app, supabase: supabase as unknown as Parameters<typeof registerNotificationRoutes>[0]['supabase'], authenticateSupabase });
 
   registerPayoutRoutes({
     app,
-    supabase,
+    supabase: supabase as Parameters<typeof registerPayoutRoutes>[0]['supabase'],
     authenticateSupabase,
     getAdminUser,
     getMpesaAccessToken,
@@ -919,7 +734,7 @@ async function startServer() {
 
   registerAdminRoutes({
     app,
-    supabase,
+    supabase: supabase as Parameters<typeof registerAdminRoutes>[0]['supabase'],
     authenticateSupabase,
     getAdminUser,
     finalizeParticipantBookingPayment,
@@ -935,16 +750,38 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     app.use(express.static("dist"));
-    app.get("*", (req, res) => res.sendFile(path.resolve("dist/index.html")));
+    app.get("*", (_req: Request, res: Response) => res.sendFile(path.resolve("dist/index.html")));
+  }
+
+  // On startup in dev, confirm any mock payments that were pending before a restart.
+  if (!config.isProd) {
+    const cutoff = new Date(Date.now() - 5_000).toISOString();
+    const { data: stuckPayments } = await supabase
+      .from("payments")
+      .select("id, event_id, user_id, payment_type")
+      .eq("payment_status", "pending")
+      .like("transaction_reference", "MOCK-%")
+      .lt("created_at", cutoff);
+    for (const p of stuckPayments ?? []) {
+      try {
+        await supabase
+          .from("payments")
+          .update({ payment_status: "confirmed", processed_at: new Date().toISOString() })
+          .eq("id", p.id);
+        await applyApprovedPaymentEffects(supabase as Parameters<typeof applyApprovedPaymentEffects>[0], p as { id: number; event_id: number; user_id: string; payment_type: string }, finalizeParticipantBookingPayment);
+      } catch (err) {
+        log({ level: 'error', message: `Failed to recover stuck mock payment ${p.id}`, error: err });
+      }
+    }
   }
 
   server.listen(config.port, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${config.port}`);
+    log({ level: 'info', message: `Server running on http://localhost:${config.port}` });
   });
 
   const shutdown = () => {
     server.close(() => {
-      console.log('Server closed');
+      log({ level: 'info', message: 'Server closed' });
       process.exit(0);
     });
     setTimeout(() => process.exit(1), 10_000);
@@ -954,6 +791,6 @@ async function startServer() {
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start server', err);
+  log({ level: 'error', message: 'Failed to start server', error: err });
   process.exit(1);
 });

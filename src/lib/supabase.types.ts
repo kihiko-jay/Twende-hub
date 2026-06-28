@@ -67,6 +67,7 @@ export interface Database {
           commission_percentage?: number;
           avatar_url?: string | null;
         };
+        Relationships: [];
       };
       photographers: {
         Row: {
@@ -92,6 +93,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["photographers"]["Insert"]>;
+        Relationships: [];
       };
       vehicles: {
         Row: {
@@ -119,6 +121,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["vehicles"]["Insert"]>;
+        Relationships: [];
       };
       events: {
         Row: {
@@ -164,6 +167,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["events"]["Insert"]>;
+        Relationships: [];
       };
       event_participants: {
         Row: {
@@ -187,6 +191,7 @@ export interface Database {
           commission_amount?: number;
         };
         Update: Partial<Database["public"]["Tables"]["event_participants"]["Insert"]>;
+        Relationships: [];
       };
       photographer_bookings: {
         Row: {
@@ -210,6 +215,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["photographer_bookings"]["Insert"]>;
+        Relationships: [];
       };
       vehicle_bookings: {
         Row: {
@@ -233,6 +239,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["vehicle_bookings"]["Insert"]>;
+        Relationships: [];
       };
       payments: {
         Row: {
@@ -261,6 +268,7 @@ export interface Database {
           payment_status?: PaymentStatus;
           transaction_reference?: string | null;
           provider_payment_id?: string | null;
+          payment_provider?: string | null;
           processed_at?: string | null;
           raw_payload?: unknown | null;
           error_code?: string | null;
@@ -270,6 +278,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["payments"]["Insert"]>;
+        Relationships: [];
       };
       payouts: {
         Row: {
@@ -301,6 +310,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["payouts"]["Insert"]>;
+        Relationships: [];
       };
       reviews: {
         Row: {
@@ -322,6 +332,7 @@ export interface Database {
           user_name?: string;
         };
         Update: Partial<Database["public"]["Tables"]["reviews"]["Insert"]>;
+        Relationships: [];
       };
       chat_messages: {
         Row: {
@@ -341,6 +352,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["chat_messages"]["Insert"]>;
+        Relationships: [];
       };
       payout_logs: {
         Row: {
@@ -364,6 +376,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["payout_logs"]["Insert"]>;
+        Relationships: [];
       };
       reported_messages: {
         Row: {
@@ -381,6 +394,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["reported_messages"]["Insert"]>;
+        Relationships: [];
       };
       revenue_summary: {
         Row: {
@@ -404,6 +418,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["revenue_summary"]["Insert"]>;
+        Relationships: [];
       };
       announcements: {
         Row: {
@@ -419,6 +434,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["announcements"]["Insert"]>;
+        Relationships: [];
       };
       activity_requests: {
         Row: {
@@ -452,6 +468,7 @@ export interface Database {
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["activity_requests"]["Insert"]>;
+        Relationships: [];
       };
       activity_request_members: {
         Row: {
@@ -467,8 +484,95 @@ export interface Database {
           joined_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["activity_request_members"]["Insert"]>;
+        Relationships: [];
+      };
+      payment_logs: {
+        Row: {
+          id: number;
+          created_at: string;
+          direction: string;
+          endpoint: string | null;
+          status_code: number | null;
+          payload: unknown | null;
+          headers: unknown | null;
+          error: string | null;
+          payment_id: number | null;
+        };
+        Insert: {
+          id?: number;
+          created_at?: string;
+          direction: string;
+          endpoint?: string | null;
+          status_code?: number | null;
+          payload?: unknown | null;
+          headers?: unknown | null;
+          error?: string | null;
+          payment_id?: number | null;
+        };
+        Update: Partial<Database["public"]["Tables"]["payment_logs"]["Insert"]>;
+        Relationships: [];
+      };
+      admin_audit_log: {
+        Row: {
+          id: number;
+          admin_user_id: string | null;
+          action: string;
+          target_type: string;
+          target_id: string;
+          details: unknown | null;
+          created_at: string | null;
+        };
+        Insert: {
+          id?: number;
+          admin_user_id?: string | null;
+          action: string;
+          target_type: string;
+          target_id: string;
+          details?: unknown | null;
+          created_at?: string | null;
+        };
+        Update: Partial<Database["public"]["Tables"]["admin_audit_log"]["Insert"]>;
+        Relationships: [];
+      };
+    };
+    Views: Record<string, never>;
+    Functions: {
+      confirm_event_creation_payment: {
+        Args: { p_event_id: number };
+        Returns: void;
+      };
+      fail_event_creation_payment: {
+        Args: { p_event_id: number; p_error_code: string; p_error_message: string };
+        Returns: void;
+      };
+      finalize_attendee_payment_by_server: {
+        Args: { p_event_id: number; p_user_id: string; p_payment_id: number };
+        Returns: void;
+      };
+      is_event_cancellable: {
+        Args: { p_event_id: number };
+        Returns: boolean;
+      };
+      is_payment_refundable: {
+        Args: { p_payment_id: number };
+        Returns: boolean;
+      };
+      create_attendee_booking_v2: {
+        Args: { p_event_id: number };
+        Returns: { id: number };
+      };
+      transition_booking_to_confirmed: {
+        Args: { p_participant_id: number; p_payment_id: number | null };
+        Returns: void;
+      };
+      join_activity_request: {
+        Args: { p_request_id: string };
+        Returns: void;
+      };
+      is_admin: {
+        Args: Record<string, never>;
+        Returns: boolean;
       };
     };
   };
 }
-

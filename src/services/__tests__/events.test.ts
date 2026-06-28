@@ -64,7 +64,7 @@ describe("events service", () => {
         error: null,
       });
 
-    await joinEvent(10, "u1");
+    await joinEvent(10);
 
     expect(mockedSupabase.rpc).toHaveBeenNthCalledWith(1, "create_attendee_booking_v2", {
       p_event_id: 10,

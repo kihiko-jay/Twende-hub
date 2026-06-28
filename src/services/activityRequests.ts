@@ -51,7 +51,7 @@ export async function listActivityRequests(
 
   if (error) throw error;
 
-  const rows = (data ?? []) as (ActivityRequestRow & { members?: ActivityRequestMemberWithUser[] })[];
+  const rows = (data ?? []) as unknown as (ActivityRequestRow & { members?: ActivityRequestMemberWithUser[] })[];
 
   return rows.map((row) => {
     const members = row.members ?? [];
@@ -78,7 +78,7 @@ export async function getActivityRequestById(id: string): Promise<ActivityReques
   if (error && error.code !== "PGRST116") throw error;
   if (!data) return null;
 
-  const row = data as ActivityRequestRow & { members?: ActivityRequestMemberWithUser[] };
+  const row = data as unknown as ActivityRequestRow & { members?: ActivityRequestMemberWithUser[] };
   const members = row.members ?? [];
 
   return {

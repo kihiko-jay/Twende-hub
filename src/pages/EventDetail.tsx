@@ -194,7 +194,7 @@ export default function EventDetail() {
     }
     setJoining(true);
     try {
-      await eventsService.joinEvent(eventIdNum, user.id);
+      await eventsService.joinEvent(eventIdNum);
       refetchEvent();
       refetchVb();
       refetchPb();

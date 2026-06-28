@@ -3,6 +3,7 @@ import { Suspense, lazy } from 'react';
 import { AuthProvider } from './contexts/AuthContext';
 import Navbar from './components/Navbar';
 import { RequireAuth } from './components/RouteGuards';
+import PageLoader from './components/PageLoader';
 
 const Home = lazy(() => import('./pages/Home'));
 const Login = lazy(() => import('./pages/Login'));
@@ -42,7 +43,7 @@ export default function App() {
             Skip to main content
           </a>
           <main id="main-content">
-            <Suspense fallback={<div className="pt-32 text-center">Loading...</div>}>
+            <Suspense fallback={<PageLoader />}>
               <Routes>
                 <Route path="/" element={<Home />} />
                 <Route path="/login" element={<Login />} />

@@ -12,6 +12,7 @@ export interface AuthedRequest extends Request {
   user: AppUser;
 }
 
-export type AuthMiddleware = (req: Request, res: Response, next: NextFunction) => void | Promise<void>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AuthMiddleware = (req: Request, res: Response, next: NextFunction) => any;
 export type AdminRequest = AuthedRequest;
 export type RegisterRoutes = (app: Express) => void;

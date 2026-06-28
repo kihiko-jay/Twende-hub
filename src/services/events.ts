@@ -180,7 +180,7 @@ export async function createEvent(organizerId: string, payload: Omit<EventInsert
   return { id: row.id };
 }
 
-export async function joinEvent(eventId: number, _userId: string): Promise<void> {
+export async function joinEvent(eventId: number): Promise<void> {
   // Step 1: ensure there is a participant row for this user + event.
   const { data: participant, error: createError } = await (supabase as any).rpc("create_attendee_booking_v2", {
     p_event_id: eventId,
